@@ -14,6 +14,7 @@ import aiohttp
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from aiohttp.client_exceptions import ClientConnectionResetError, ClientConnectorError, ServerDisconnectedError, ClientOSError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -58,12 +59,33 @@ def has_mm_input(request_data: dict):
     return False
 
 
+async def _log_and_maybe_retry(e, attempt, max_retries, base_delay, endpoint):
+    if attempt < max_retries:
+        logger.warning(
+            f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}"
+        )
+        await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+    else:
+        logger.error(
+            f"All {max_retries} attempts failed for streaming {endpoint}."
+        )
+        raise e
+
+RETRY_EXCEPTIONS = (
+    ClientConnectionResetError,
+    ClientConnectorError,
+    ServerDisconnectedError,
+    ClientOSError,
+)
+
 async def forward_streaming_request(
     request_data: dict,
     request_id: str,
     e_server_url: str,
     pd_server_url: str,
-) -> AsyncIterator[str]:
+    max_retries: int = 3,
+    retry_delay: float = 0.2,
+    ) -> AsyncIterator[str]:
     headers = {"x-request-id": request_id}
     # Skip request to encoder instance if we don't have mm input
     if has_mm_input(request_data):
@@ -73,40 +95,35 @@ async def forward_streaming_request(
         encoder_request_data.pop("stream_options", None)
         if "max_completion_tokens" in encoder_request_data:
             encoder_request_data["max_completion_tokens"] = 1
-        task1 = asyncio.create_task(
-            encode_session.post(
-                f"{e_server_url}/v1/chat/completions",
-                json=encoder_request_data,
-                headers=headers,
-            )
-        )
-        try:
-            response = await task1
-            if response.status != 200:
-                error_text = await response.text()
-                raise HTTPException(
-                    status_code=response.status,
-                    detail={"error": "Request failed", "message": error_text},
+        for attempt in range(1, max_retries + 1):
+            try:
+                task1 = asyncio.create_task(
+                    encode_session.post(
+                        f"{e_server_url}/v1/chat/completions",
+                        json=encoder_request_data,
+                        headers=headers,
+                    )
                 )
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail={"error": "Internal server error", "message": str(e)},
-            ) from e
+                response = await task1
+                response.raise_for_status()
+                break
+            except RETRY_EXCEPTIONS as e:
+                await _log_and_maybe_retry(e, attempt, max_retries, retry_delay, f"{e_server_url}/v1/chat/completions")
 
-    # import time
-    # time.sleep(10)
-    try:
-        async with decode_session.post(
-            f"{pd_server_url}/v1/chat/completions", json=request_data, headers=headers
-        ) as response:
-            response.raise_for_status()
-            async for chunk in response.content.iter_chunked(128):
-                if chunk:
-                    yield chunk.decode("utf-8", errors="ignore")
-    except Exception as e:
-        logger.error("Error in streaming: %s", e)
-        raise
+    first_chunk_send = False
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with decode_session.post(
+                f"{pd_server_url}/v1/chat/completions", json=request_data, headers=headers
+            ) as response:
+                response.raise_for_status()
+                async for chunk in response.content.iter_chunked(128):
+                    if chunk:
+                        first_chunk_send = True
+                        yield chunk.decode("utf-8", errors="ignore")
+        except RETRY_EXCEPTIONS as e:
+            if not first_chunk_send:
+                await _log_and_maybe_retry(e, attempt, max_retries, retry_delay, f"{pd_server_url}/v1/chat/completions")
 
 
 async def forward_non_streaming_request(
@@ -114,6 +131,8 @@ async def forward_non_streaming_request(
     request_id: str,
     e_server_url: str,
     pd_server_url: str,
+    max_retries: int = 3,
+    retry_delay: float = 0.2,
 ) -> dict:
     headers = {"x-request-id": request_id}
     # Skip request to encoder instance if we don't have mm input
@@ -123,39 +142,31 @@ async def forward_non_streaming_request(
         if "max_completion_tokens" in encoder_request_data:
             encoder_request_data["max_completion_tokens"] = 1
         # Start request to encode server
-        task1 = asyncio.create_task(
-            encode_session.post(
-                f"{e_server_url}/v1/chat/completions",
-                json=encoder_request_data,
-                headers=headers,
-            )
-        )
-
-        try:
-            response = await task1
-            if response.status != 200:
-                error_text = await response.text()
-                raise HTTPException(
-                    status_code=response.status,
-                    detail={"error": "Request failed", "message": error_text},
+        for attempt in range(1, max_retries + 1):
+            try:
+                task1 = asyncio.create_task(
+                    encode_session.post(
+                        f"{e_server_url}/v1/chat/completions",
+                        json=encoder_request_data,
+                        headers=headers,
+                    )
                 )
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail={"error": "Internal server error", "message": str(e)},
-            ) from e
+                response = await task1
+                response.raise_for_status()
+                break
+            except RETRY_EXCEPTIONS as e:
+                await _log_and_maybe_retry(e, attempt, max_retries, retry_delay, f"{e_server_url}/v1/chat/completions")
 
-    try:
-        # Make request to decode server
-        async with decode_session.post(
-            f"{pd_server_url}/v1/chat/completions", json=request_data, headers=headers
-        ) as response2:
-            response2.raise_for_status()
-            result = await response2.json()
-        return result
-    except Exception as e:
-        logger.error("Error in non-streaming: %s", e)
-        raise
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with decode_session.post(
+                f"{pd_server_url}/v1/chat/completions", json=request_data, headers=headers
+            ) as response:
+                response.raise_for_status()
+                result = await response.json()
+                return result
+        except RETRY_EXCEPTIONS as e:
+            await _log_and_maybe_retry(e, attempt, max_retries, retry_delay, f"{pd_server_url}/v1/chat/completions")
 
 
 @app.post("/v1/chat/completions")
