@@ -541,3 +541,40 @@ def seq_cls_model_loader(model, weights: Iterable[tuple[str, torch.Tensor]]):
     method = getattr(text_config, "method", None)
     assert method in SEQ_CLS_LOAD_METHODS, f"method {method} not supported"
     return SEQ_CLS_LOAD_METHODS[method](model, weights)
+
+
+def as_vision_only_model(cls: _T) -> _T:
+    """
+    Subclass an existing vLLM vl model to support vision-only for EPD encoder instances.
+    """
+    Unuse_attr = ["language_model"]
+
+    class ModelForVisionOnly(cls):
+        def __init__(
+            self,
+            *,
+            vllm_config: "VllmConfig",
+            prefix: str = "",
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(vllm_config=vllm_config, prefix=prefix, **kwargs)
+
+            # These are not used in vision-only models
+            for attr in Unuse_attr:
+                if hasattr(self, attr):
+                    delattr(self, attr)
+
+        def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+            from .utils import (
+                AutoWeightsLoader,
+            )
+
+            skip_prefixes = []
+            if self.visual is None:
+                skip_prefixes.extend(["visual."])
+            if self.language_model is None:
+                skip_prefixes.extend(["language_model."])
+            loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
+            return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    return ModelForVisionOnly  # type: ignore

@@ -169,6 +169,7 @@ def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module],
         as_embedding_model,
         as_reward_model,
         as_seq_cls_model,
+        as_vision_only_model,
         try_create_mm_pooling_model_cls,
     )
 
@@ -201,6 +202,9 @@ def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module],
 
     if convert_type == "none":
         pass
+    elif convert_type == "vision_only":
+        logger.debug_once("Converting to vision-only model.")
+        model_cls = as_vision_only_model(model_cls)
     elif convert_type == "embed":
         logger.debug_once("Converting to embedding model.")
         model_cls = as_embedding_model(model_cls)
