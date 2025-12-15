@@ -198,6 +198,10 @@ def _get_model_architecture(
 
     if convert_type == "none":
         pass
+    elif convert_type == "vision_only":
+        logger.debug_once("Converting to vision-only model.")
+        from vllm.model_executor.models.adapters import as_vision_only_model
+        model_cls = as_vision_only_model(model_cls)
     elif convert_type == "embed":
         logger.debug_once("Converting to embedding model.")
         model_cls = as_embedding_model(model_cls)

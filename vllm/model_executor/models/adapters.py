@@ -540,3 +540,52 @@ def seq_cls_model_loader(model, weights: Iterable[tuple[str, torch.Tensor]]):
     method = getattr(config, "method", None)
     assert method in SEQ_CLS_LOAD_METHODS, f"method {method} not supported"
     return SEQ_CLS_LOAD_METHODS[method](model, weights)
+
+
+def as_vision_only_model(cls: _T) -> _T:
+    """
+    Subclass an existing vLLM vl model to support vision-only for
+    EPD encoder instances.
+    """
+
+    if not hasattr(cls, "get_multimodal_embeddings"):
+        return cls  # only for multimodal models
+
+    if not hasattr(cls, "get_model_spec"):
+        raise TypeError(f"{cls} need to implement `get_model_spec` method.")
+
+    lm_model, lm_attr = cls.get_model_spec()
+
+    class FakeLM(nn.Module):
+
+        def __init__(self, *args, **kwargs):
+            self.make_empty_intermediate_tensors = None
+
+    class ModelForVisionOnly(cls):
+
+        def __init__(
+            self,
+            *,
+            vllm_config: "VllmConfig",
+            prefix: str = "",
+            **kwargs: Any,
+        ) -> None:
+            origin_init = lm_model.__init__
+            lm_model.__init__ = FakeLM.__init__
+
+            super().__init__(vllm_config=vllm_config, prefix=prefix, **kwargs)
+
+            lm_model.__init__ = origin_init
+
+            if hasattr(self, lm_attr):
+                delattr(self, lm_attr)
+
+        def load_weights(
+                self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+            from .utils import AutoWeightsLoader
+
+            skip_prefixes = [f"{lm_attr}."]
+            loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
+            return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    return ModelForVisionOnly  # type: ignore

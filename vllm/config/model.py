@@ -59,7 +59,7 @@ else:
 logger = init_logger(__name__)
 
 RunnerOption = Literal["auto", "generate", "pooling", "draft"]
-ConvertType = Literal["none", "embed", "classify", "reward"]
+ConvertType = Literal["none", "embed", "classify", "reward", "vision_only"]
 ConvertOption = Literal["auto", ConvertType]
 TaskOption = Literal["auto", "generate", "embedding", "embed", "classify",
                      "score", "reward", "transcription", "draft"]
