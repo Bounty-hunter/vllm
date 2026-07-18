@@ -439,19 +439,28 @@ def fused_moe_kernel(
         a_ptrs = a_ptr + (
             offs_k[:, None] * stride_ak + offs_token[None, :] // top_k * stride_am
         )
-        b_ptrs = (
-            b_ptr
-            + off_experts * stride_be
-            + (offs_bn[:, None] * stride_bn + offs_k[None, :] * stride_bk)
+        # B 权重 (E,N,K), K 连续(stride_bk==1) -> make_block_ptr 发 TMA
+        # expert 维用 base 偏移; SWAP: block (N,K), K 在 dim1 -> order=(1,0)
+        b_block_ptr = tl.make_block_ptr(
+            base=b_ptr + off_experts * stride_be,
+            shape=(N, K),
+            strides=(stride_bn, stride_bk),
+            offsets=(pid_n * BLOCK_SIZE_N, 0),
+            block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K),
+            order=(1, 0),
         )
     else:
         a_ptrs = a_ptr + (
             offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
         )
-        b_ptrs = (
-            b_ptr
-            + off_experts * stride_be
-            + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        # 非 SWAP: block (K,N), K 在 dim0 -> order=(0,1)
+        b_block_ptr = tl.make_block_ptr(
+            base=b_ptr + off_experts * stride_be,
+            shape=(K, N),
+            strides=(stride_bk, stride_bn),
+            offsets=(0, pid_n * BLOCK_SIZE_N),
+            block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+            order=(0, 1),
         )
 
     if use_int8_w8a16:
@@ -499,16 +508,15 @@ def fused_moe_kernel(
         # K dimension.
         if SWAP_AB:
             a_mask = (offs_k[:, None] < K - k * BLOCK_SIZE_K) & token_mask[None, :]
-            b_mask = offs_k[None, :] < K - k * BLOCK_SIZE_K
         else:
             a_mask = token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K)
-            b_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
         a = tl.load(
             a_ptrs,
             mask=a_mask,
             other=0.0,
         )
-        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        # B 经 make_block_ptr 加载, boundary_check 处理尾块越界(等价原 b_mask)
+        b = tl.load(b_block_ptr, boundary_check=(0, 1))
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -537,7 +545,10 @@ def fused_moe_kernel(
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        if SWAP_AB:
+            b_block_ptr = tl.advance(b_block_ptr, (0, BLOCK_SIZE_K))
+        else:
+            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
 
     if SWAP_AB:
         accumulator = tl.trans(accumulator, (1, 0))
