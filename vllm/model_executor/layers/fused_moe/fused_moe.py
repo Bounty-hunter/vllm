@@ -439,13 +439,14 @@ def fused_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    # Remap padded token ids to 0 so A loads stay in-bounds without a
-    # per-K-iter token_mask (pad rows are discarded by c_mask on store).
-    a_token = tl.where(token_mask, offs_token, 0) // top_k
     if SWAP_AB:
-        a_ptrs = a_ptr + (offs_k[:, None] * stride_ak + a_token[None, :] * stride_am)
+        a_ptrs = a_ptr + (
+            offs_k[:, None] * stride_ak + offs_token[None, :] // top_k * stride_am
+        )
     else:
-        a_ptrs = a_ptr + (a_token[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        a_ptrs = a_ptr + (
+            offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+        )
 
     if USE_TMA:
         # B is (E, N, K), K contiguous. Describe one expert as (N, K); expert
@@ -511,17 +512,19 @@ def fused_moe_kernel(
     else:
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # EVEN_K + safe a_token: no mask on A. Else only K-boundary mask.
-        # Token pad is handled by a_token remap + masked C store.
+        # Load the next block of A and B. When EVEN_K, omit K-boundary
+        # predicates (ISETP/LOP/SEL) on full tiles; keep token_mask for pad.
         if EVEN_K:
-            a = tl.load(a_ptrs)
+            a_mask = token_mask[None, :] if SWAP_AB else token_mask[:, None]
+        elif SWAP_AB:
+            a_mask = (offs_k[:, None] < K - k * BLOCK_SIZE_K) & token_mask[None, :]
         else:
-            a_mask = (
-                offs_k[:, None] < K - k * BLOCK_SIZE_K
-                if SWAP_AB
-                else offs_k[None, :] < K - k * BLOCK_SIZE_K
-            )
-            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+            a_mask = token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K)
+        a = tl.load(
+            a_ptrs,
+            mask=a_mask,
+            other=0.0,
+        )
         if USE_TMA:
             # TMA returns (BN, BK). SWAP uses it as-is; otherwise transpose.
             b_block = b_desc.load([pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K])
