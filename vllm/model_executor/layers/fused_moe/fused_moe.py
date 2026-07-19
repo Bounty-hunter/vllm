@@ -39,6 +39,76 @@ logger = init_logger(__name__)
 
 
 @triton.jit
+def _moe_gather_a_kernel(
+    a_ptr,
+    out_ptr,
+    sorted_token_ids_ptr,
+    stride_am,
+    stride_ak,
+    stride_om,
+    stride_ok,
+    num_valid_tokens,
+    top_k,
+    K,
+    EM,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Gather A[token] into contiguous rows ordered by sorted_token_ids."""
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    m_mask = offs_m < EM
+    k_mask = offs_k < K
+
+    tok = tl.load(sorted_token_ids_ptr + offs_m, mask=m_mask, other=0).to(tl.int64)
+    valid = m_mask & (tok < num_valid_tokens)
+    a_row = tok // top_k
+    a = tl.load(
+        a_ptr + a_row[:, None] * stride_am + offs_k[None, :] * stride_ak,
+        mask=valid[:, None] & k_mask[None, :],
+        other=0.0,
+    )
+    tl.store(
+        out_ptr + offs_m[:, None] * stride_om + offs_k[None, :] * stride_ok,
+        a,
+        mask=m_mask[:, None] & k_mask[None, :],
+    )
+
+
+def moe_gather_a_contiguous(
+    A: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    num_valid_tokens: int,
+    top_k: int,
+) -> torch.Tensor:
+    """Materialize expert-sorted contiguous activations for CONTIG_A GEMM."""
+    EM = sorted_token_ids.size(0)
+    K = A.size(1)
+    out = torch.empty((EM, K), device=A.device, dtype=A.dtype)
+    BLOCK_M = 64
+    BLOCK_K = 64
+    grid = (triton.cdiv(EM, BLOCK_M), triton.cdiv(K, BLOCK_K))
+    _moe_gather_a_kernel[grid](
+        A,
+        out,
+        sorted_token_ids,
+        A.stride(0),
+        A.stride(1),
+        out.stride(0),
+        out.stride(1),
+        num_valid_tokens,
+        top_k,
+        K,
+        EM,
+        BLOCK_M=BLOCK_M,
+        BLOCK_K=BLOCK_K,
+    )
+    return out
+
+
+@triton.jit
 def write_zeros_to_output(
     c_ptr,
     stride_cm,
@@ -350,6 +420,8 @@ def fused_moe_kernel(
     USE_TMA: tl.constexpr,
     # True when K % BLOCK_SIZE_K == 0: skip per-iter K-boundary predicates.
     EVEN_K: tl.constexpr,
+    # A is already expert-sorted contiguous (from moe_gather_a_contiguous).
+    CONTIG_A: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -439,7 +511,14 @@ def fused_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    if SWAP_AB:
+    if CONTIG_A:
+        # Rows of A match sorted block order; pad rows are zeros from gather.
+        a_row = (pid_m * BLOCK_SIZE_M + offs).to(tl.int64)
+        if SWAP_AB:
+            a_ptrs = a_ptr + (offs_k[:, None] * stride_ak + a_row[None, :] * stride_am)
+        else:
+            a_ptrs = a_ptr + (a_row[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    elif SWAP_AB:
         a_ptrs = a_ptr + (
             offs_k[:, None] * stride_ak + offs_token[None, :] // top_k * stride_am
         )
@@ -512,19 +591,26 @@ def fused_moe_kernel(
     else:
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B. When EVEN_K, omit K-boundary
-        # predicates (ISETP/LOP/SEL) on full tiles; keep token_mask for pad.
-        if EVEN_K:
+        # CONTIG_A: pad rows are already zero → no token_mask on A loads.
+        # EVEN_K: omit K-boundary predicates on full tiles.
+        if CONTIG_A and EVEN_K:
+            a = tl.load(a_ptrs)
+        elif CONTIG_A:
+            a_mask = (
+                offs_k[:, None] < K - k * BLOCK_SIZE_K
+                if SWAP_AB
+                else offs_k[None, :] < K - k * BLOCK_SIZE_K
+            )
+            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        elif EVEN_K:
             a_mask = token_mask[None, :] if SWAP_AB else token_mask[:, None]
+            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
         elif SWAP_AB:
             a_mask = (offs_k[:, None] < K - k * BLOCK_SIZE_K) & token_mask[None, :]
+            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
         else:
             a_mask = token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K)
-        a = tl.load(
-            a_ptrs,
-            mask=a_mask,
-            other=0.0,
-        )
+            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
         if USE_TMA:
             # TMA returns (BN, BK). SWAP uses it as-is; otherwise transpose.
             b_block = b_desc.load([pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K])
@@ -834,13 +920,20 @@ def invoke_fused_moe_triton_kernel(
     )
     HAS_BIAS = B_bias is not None
 
+    # Opt-in: gather A into expert-sorted contiguous rows so K-loop loads
+    # coalesce (see design/20260719-fused-moe-contig-a.md).
+    CONTIG_A = bool(envs.VLLM_FUSED_MOE_CONTIG_A and sorted_token_ids is not None)
+    A_kernel = A
+    if CONTIG_A:
+        A_kernel = moe_gather_a_contiguous(A, sorted_token_ids, num_tokens, top_k)
+
     config = config.copy()
     config["SPLIT_K"] = 1
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
     if block_shape is not None:
         BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0], block_shape[1]))
     fused_moe_kernel[grid](
-        A,
+        A_kernel,
         B,
         C,
         B_bias,
@@ -854,8 +947,8 @@ def invoke_fused_moe_triton_kernel(
         B.size(2),
         EM,
         num_tokens,
-        A.stride(0),
-        A.stride(1),
+        A_kernel.stride(0),
+        A_kernel.stride(1),
         B.stride(0),
         B.stride(2),
         B.stride(1),
@@ -883,6 +976,7 @@ def invoke_fused_moe_triton_kernel(
         SWAP_AB=SWAP_AB,
         USE_TMA=USE_TMA,
         EVEN_K=(B.size(2) % BLOCK_SIZE_K == 0),
+        CONTIG_A=CONTIG_A,
         **config,
     )
 
