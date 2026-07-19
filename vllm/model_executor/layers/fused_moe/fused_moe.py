@@ -348,6 +348,8 @@ def fused_moe_kernel(
     HAS_BIAS: tl.constexpr,
     SWAP_AB: tl.constexpr,
     USE_TMA: tl.constexpr,
+    # True when K % BLOCK_SIZE_K == 0: skip per-iter K-boundary predicates.
+    EVEN_K: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -510,9 +512,11 @@ def fused_moe_kernel(
     else:
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the
-        # K dimension.
-        if SWAP_AB:
+        # Load the next block of A and B. When EVEN_K, omit K-boundary
+        # predicates (ISETP/LOP/SEL) on full tiles; keep token_mask for pad.
+        if EVEN_K:
+            a_mask = token_mask[None, :] if SWAP_AB else token_mask[:, None]
+        elif SWAP_AB:
             a_mask = (offs_k[:, None] < K - k * BLOCK_SIZE_K) & token_mask[None, :]
         else:
             a_mask = token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K)
@@ -525,11 +529,14 @@ def fused_moe_kernel(
             # TMA returns (BN, BK). SWAP uses it as-is; otherwise transpose.
             b_block = b_desc.load([pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K])
             b = b_block if SWAP_AB else tl.trans(b_block)
+        elif EVEN_K:
+            b = tl.load(b_ptrs)
         else:
-            if SWAP_AB:
-                b_mask = offs_k[None, :] < K - k * BLOCK_SIZE_K
-            else:
-                b_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
+            b_mask = (
+                offs_k[None, :] < K - k * BLOCK_SIZE_K
+                if SWAP_AB
+                else offs_k[:, None] < K - k * BLOCK_SIZE_K
+            )
             b = tl.load(b_ptrs, mask=b_mask, other=0.0)
         # We accumulate along the K dimension.
         if use_int8_w8a16:
@@ -875,6 +882,7 @@ def invoke_fused_moe_triton_kernel(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         SWAP_AB=SWAP_AB,
         USE_TMA=USE_TMA,
+        EVEN_K=(B.size(2) % BLOCK_SIZE_K == 0),
         **config,
     )
 
